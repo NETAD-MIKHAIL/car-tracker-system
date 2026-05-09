@@ -4,11 +4,16 @@ from requests.auth import HTTPBasicAuth
 
 app = FastAPI()
 
-# =========================
-# TELEGRAM CONFIG
-# =========================
-BOT_TOKEN = "8751356581:AAGPBAD66cbzx-ZksXZ1ji8GMubP765sljw"
-CHAT_ID = "-1003962570918"
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+CARTRACK_API_URL = os.getenv("CARTRACK_API_URL")
+CARTRACK_USERNAME = os.getenv("CARTRACK_USERNAME")
+CARTRACK_PASSWORD = os.getenv("CARTRACK_PASSWORD")
 
 def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -19,15 +24,6 @@ def send_telegram(message: str):
         }, timeout=5)
     except Exception as e:
         print("Telegram error:", e)
-
-# =========================
-# CARTRACK CONFIG
-# =========================
-CARTRACK_USERNAME = "HEXA00001"
-CARTRACK_PASSWORD = "9af99274d0f0b424205b82eadb97b8b2c66dc5edc1f4ddb3c964bee8ecd1c69e"
-
-CARTRACK_API_URL = "https://fleetapi-ph.cartrack.com/rest/vehicles"
-
 
 def get_fleet_data():
     try:
