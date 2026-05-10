@@ -3,7 +3,8 @@ import requests
 from requests.auth import HTTPBasicAuth
 import os
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 load_dotenv()
 
@@ -129,20 +130,62 @@ def elapsed_minutes(start_time, end_time):
 
     return max(0, (end_time - start_time).total_seconds() / 60)
 
+def get_manila_tz():
+    try:
+        return ZoneInfo("Asia/Manila")
+    except ZoneInfoNotFoundError:
+        return timezone(timedelta(hours=8))
+
+
+def parse_event_time(event_time):
+    text = str(event_time).strip()
+    if not text:
+        return None
+
+    if text.endswith("Z"):
+        try:
+            dt = datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
+            dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(get_manila_tz())
+        except ValueError:
+            return None
+
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=get_manila_tz())
+        return dt.astimezone(get_manila_tz())
+    except ValueError:
+        pass
+
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S %z",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M",
+    ]:
+        try:
+            dt = datetime.strptime(text, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=get_manila_tz())
+            return dt.astimezone(get_manila_tz())
+        except ValueError:
+            continue
+
+    return None
+
+
 def format_event_time(event_time):
-    text = str(event_time)
-    upper_text = text.upper()
+    dt = parse_event_time(event_time)
+    if dt is not None:
+        return dt.strftime("%Y-%m-%d %I:%M:%S %p PHT")
 
-    if (
-        " PHT" in upper_text
-        or " UTC" in upper_text
-        or " GMT" in upper_text
-        or text.endswith("Z")
-        or "+" in text[10:]
-    ):
-        return text
-
-    return f"{text} PHT"
+    text = str(event_time).strip()
+    if not text:
+        return "Unknown time"
+    return text
 
 def format_location_time(location: str, event_time: str):
     return (

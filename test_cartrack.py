@@ -11,7 +11,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 CARTRACK_USERNAME = os.getenv("CARTRACK_USERNAME")
 CARTRACK_PASSWORD = os.getenv("CARTRACK_PASSWORD")
-CARTRACK_API_URL = os.getenv("CARTRACK_API_URL", "https://fleetapi-ph.cartrack.com/rest/vehicles")
+CARTRACK_API_URL = os.getenv("CARTRACK_API_URL", "https://fleetapi-ph.cartrack.com/rest/vehicles/status")
 
 SAMPLE_SPEEDING_CAR = {
     "name": "ABC123",
