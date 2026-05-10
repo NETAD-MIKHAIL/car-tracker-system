@@ -442,14 +442,23 @@ def get_vehicle_location(vehicle: dict):
         location.get("lon")
     )
 
-    address = (
-        vehicle.get("address")
-        or location.get("address")
-        or location.get("description")
+    location_name = first_present(
+        vehicle.get("location_name"),
+        vehicle.get("position_description"),
+        vehicle.get("location_description"),
+        vehicle.get("area"),
+        location.get("location_name"),
+        location.get("position_description"),
+        location.get("location_description"),
+        location.get("area"),
+        location.get("name"),
+        location.get("label"),
+        location.get("description"),
+        location.get("address")
     )
 
-    if address:
-        return address
+    if location_name:
+        return str(location_name)
 
     if latitude is not None and longitude is not None:
         return f"{latitude}, {longitude}"
