@@ -15,7 +15,7 @@ CARTRACK_API_URL = os.getenv("CARTRACK_API_URL", "https://fleetapi-ph.cartrack.c
 
 SAMPLE_SPEEDING_CAR = {
     "name": "ABC123",
-    "speed": 95,
+    "speed": 125,
     "location": "14.5995, 120.9842",
     "time": "2026-05-10 15:30:00",
 }
