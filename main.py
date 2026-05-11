@@ -1,3 +1,5 @@
+import asyncio
+import json
 from fastapi import FastAPI
 import requests
 from requests.auth import HTTPBasicAuth
@@ -19,7 +21,10 @@ CHAT_ID = os.getenv("CHAT_ID")
 CARTRACK_API_URL = os.getenv("CARTRACK_API_URL")
 CARTRACK_USERNAME = os.getenv("CARTRACK_USERNAME")
 CARTRACK_PASSWORD = os.getenv("CARTRACK_PASSWORD")
-SPEED_LIMIT_KMH = 80
+SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "60"))
+ALERT_DEDUPE_SECONDS = int(os.getenv("ALERT_DEDUPE_SECONDS", str(SYNC_INTERVAL_SECONDS)))
+SPEED_LIMIT_KMH = 120
+LOW_FUEL_LITERS = 4
 IDLE_LIMIT_MINUTES = 10
 VEHICLE_ID_KEYS = (
     "vehicle_id",
@@ -44,6 +49,20 @@ VEHICLE_NAME_KEYS = (
     "name",
     "label",
 )
+VEHICLE_MODEL_KEYS = (
+    "model",
+    "vehicle_model",
+    "vehicleModel",
+    "make_model",
+    "makeModel",
+    "asset_model",
+    "assetModel",
+)
+VEHICLE_MODEL_BY_PLATE = {
+    "KAR6444": "Toyota Hilux",
+    "KAR6412": "Toyota Innova",
+    "KAR6558": "Toyota Hilux",
+}
 VEHICLE_LIST_KEYS = (
     "data",
     "vehicles",
@@ -59,6 +78,9 @@ VEHICLE_LIST_KEYS = (
 # STATE STORAGE (ANTI-SPAM)
 # =========================
 last_state = {}
+last_alert_messages = {}
+auto_sync_task = None
+ALERT_CACHE_FILE = ".alert_cache.json"
 
 def first_present(*values):
     for value in values:
@@ -72,6 +94,28 @@ def first_key(data: dict, keys):
 
         if value is not None:
             return value
+
+    return None
+
+def first_nested_key(data, keys):
+    if isinstance(data, dict):
+        value = first_key(data, keys)
+
+        if value is not None:
+            return value
+
+        for nested in data.values():
+            value = first_nested_key(nested, keys)
+
+            if value is not None:
+                return value
+
+    if isinstance(data, list):
+        for item in data:
+            value = first_nested_key(item, keys)
+
+            if value is not None:
+                return value
 
     return None
 
@@ -104,6 +148,18 @@ def format_speed(speed):
         return str(int(speed))
 
     return str(speed)
+
+def format_percent(value):
+    if value is None:
+        return "Unknown"
+
+    return format_speed(value)
+
+def format_fuel_liters(value):
+    if value is None:
+        return "Unknown"
+
+    return f"{format_percent(value)} L"
 
 def format_minutes(minutes):
     minutes = to_number(minutes, 0)
@@ -205,6 +261,36 @@ def format_speeding_alert(name: str, speed, location: str, event_time: str):
         *format_location_time(location, event_time)
     )
 
+def format_car_status_alert(name: str, status_data: dict):
+    speed = status_data.get('speed', 0)
+    location = status_data.get('location', 'Unknown')
+    event_time = status_data.get('time', 'Unknown')
+    ignition = status_data.get('ignition', False)
+    speeding = status_data.get('speeding', False)
+    idling_too_long = status_data.get('idling_too_long', False)
+    idle_minutes = status_data.get('idle_minutes')
+
+    icon = "🚗" if ignition else "🛑"
+    ignition_status = "RUNNING" if ignition else "STOPPED"
+    speed_text = format_speed(speed)
+
+    lines = [
+        f"Speed: {speed_text} km/h",
+        f"Status: {ignition_status}",
+    ]
+
+    if speeding:
+        lines.append(f"⚠️ SPEEDING!")
+
+    if idling_too_long and idle_minutes:
+        lines.append(f"⏱ Idling for {format_minutes(idle_minutes)}")
+
+    return format_alert(
+        f"{icon} STATUS - {name}",
+        *lines,
+        *format_location_time(location, event_time)
+    )
+
 def format_ignition_alert(name: str, ignition: bool, location: str, event_time: str):
     icon = "🔑" if ignition else "🔒"
     status = "IGNITION ON" if ignition else "IGNITION OFF"
@@ -217,6 +303,14 @@ def format_ignition_alert(name: str, ignition: bool, location: str, event_time: 
 def format_motion_alert(name: str, location: str, event_time: str):
     return format_alert(
         f"🟢 MOTION STARTED - {name}",
+        *format_location_time(location, event_time)
+    )
+
+def format_location_update_alert(name: str, speed, fuel, location: str, event_time: str):
+    return format_alert(
+        f"📍 LOCATION UPDATE - {name}",
+        f"⚡ Speed: {format_speed(speed)} km/h",
+        f"⛽ Fuel: {format_fuel_liters(fuel)}",
         *format_location_time(location, event_time)
     )
 
@@ -236,9 +330,52 @@ def format_idling_too_long_alert(name: str, idle_minutes, location: str, event_t
 def format_fuel_alert(name: str, fuel, location: str, event_time: str):
     return format_alert(
         f"⛽ FUEL LOW - {name}",
-        f"Fuel: {format_speed(fuel)}%",
+        f"Fuel: {format_fuel_liters(fuel)} (Warning below {LOW_FUEL_LITERS} L)",
         *format_location_time(location, event_time)
     )
+
+def already_sent_recently(message: str, now: datetime):
+    last_sent_at = last_alert_messages.get(message)
+
+    if last_sent_at and (now - last_sent_at).total_seconds() < ALERT_DEDUPE_SECONDS:
+        return True
+
+    try:
+        with open(ALERT_CACHE_FILE, "r", encoding="utf-8") as cache_file:
+            cache = json.load(cache_file)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        cache = {}
+
+    cutoff = now.timestamp() - ALERT_DEDUPE_SECONDS
+    cache = {
+        cached_message: sent_at
+        for cached_message, sent_at in cache.items()
+        if sent_at >= cutoff
+    }
+
+    if cache.get(message, 0) >= cutoff:
+        last_alert_messages[message] = datetime.fromtimestamp(cache[message])
+        return True
+
+    cache[message] = now.timestamp()
+    last_alert_messages[message] = now
+
+    try:
+        with open(ALERT_CACHE_FILE, "w", encoding="utf-8") as cache_file:
+            json.dump(cache, cache_file)
+    except OSError as e:
+        print(f"Alert cache write failed: {e}")
+
+    return False
+
+def send_vehicle_alerts(alerts):
+    if alerts:
+        message = alerts[0]
+        now = datetime.now()
+
+        if already_sent_recently(message, now):
+            return
+        send_telegram(message)
 
 # =========================
 # TELEGRAM
@@ -290,6 +427,19 @@ def get_vehicle_id(vehicle: dict):
 def get_vehicle_name(vehicle: dict):
     return first_key(vehicle, VEHICLE_NAME_KEYS) or get_vehicle_id(vehicle) or "Vehicle"
 
+def get_vehicle_model(vehicle: dict):
+    name = str(get_vehicle_name(vehicle)).strip().upper()
+    return VEHICLE_MODEL_BY_PLATE.get(name) or first_key(vehicle, VEHICLE_MODEL_KEYS)
+
+def get_vehicle_display_name(vehicle: dict):
+    name = str(get_vehicle_name(vehicle))
+    model = get_vehicle_model(vehicle)
+
+    if model:
+        return f"{name} ({model})"
+
+    return name
+
 def get_vehicle_speed(vehicle: dict):
     return to_number(
         first_key(
@@ -308,19 +458,86 @@ def get_vehicle_speed(vehicle: dict):
     )
 
 def get_vehicle_fuel(vehicle: dict):
-    return to_number(
-        first_key(
-            vehicle,
+    fuel_level_keys = (
+        "fuel_level",
+        "fuelLevel",
+        "tank_level",
+        "tankLevel",
+        "fuel",
+    )
+
+    fuel_value = first_nested_key(vehicle, fuel_level_keys)
+
+    if isinstance(fuel_value, dict):
+        fuel_value = first_key(
+            fuel_value,
             (
-                "fuel",
-                "fuel_level",
-                "fuelLevel",
+                "level",
+                "value",
+                "remaining",
+                "liters",
+                "litres",
+                "liter",
+                "litre",
+            )
+        )
+
+    if fuel_value is None:
+        return None
+
+    fuel = to_number(fuel_value, None)
+
+    if fuel is None:
+        return None
+
+    return fuel
+
+def get_vehicle_fuel_percent(vehicle: dict):
+    fuel_percent_keys = (
+        "fuel_percent",
+        "fuelPercent",
+        "fuel_percentage",
+        "fuelPercentage",
+        "fuel_level_percentage",
+        "fuelLevelPercentage",
+        "fuel_tank_percentage",
+        "fuelTankPercentage",
+        "fuel_level_perc",
+        "fuelLevelPerc",
+        "fuel_perc",
+        "fuelPerc",
+    )
+
+    fuel_percent = first_nested_key(vehicle, fuel_percent_keys)
+
+    if isinstance(fuel_percent, dict):
+        fuel_percent = first_key(
+            fuel_percent,
+            (
+                "percent",
+                "percentage",
+                "value",
+                "remaining",
                 "fuel_percent",
                 "fuelPercent",
             )
-        ),
-        100
-    )
+        )
+
+    if fuel_percent is None:
+        return None
+
+    fuel_percent = to_number(fuel_percent, None)
+
+    if fuel_percent is None:
+        return None
+
+    if 0 < fuel_percent <= 1:
+        return fuel_percent * 100
+
+    return fuel_percent
+
+def is_low_fuel(fuel_liters):
+    return fuel_liters is not None and fuel_liters < LOW_FUEL_LITERS
 
 def get_vehicle_idle_minutes(vehicle: dict):
     idle_minutes = first_key(
@@ -611,7 +828,7 @@ def reverse_geocode(latitude: float, longitude: float) -> str:
     return None
 
 def format_vehicle_status(name: str, speed, location: str, event_time: str):
-    speeding = speed > SPEED_LIMIT_KMH
+    speeding = speed >= SPEED_LIMIT_KMH
     speed_text = format_speed(speed)
     speed_status = "SPEEDING" if speeding else "Within speed limit"
 
@@ -624,6 +841,8 @@ def format_vehicle_status(name: str, speed, location: str, event_time: str):
 
 def build_vehicle_status(vehicle: dict):
     speed = get_vehicle_speed(vehicle)
+    fuel = get_vehicle_fuel(vehicle)
+    fuel_percent = get_vehicle_fuel_percent(vehicle)
     idle_minutes = get_vehicle_idle_minutes(vehicle)
     idling_too_long = (
         get_ignition(vehicle)
@@ -634,37 +853,92 @@ def build_vehicle_status(vehicle: dict):
 
     return {
         "id": get_vehicle_id(vehicle) or get_vehicle_name(vehicle),
-        "name": get_vehicle_name(vehicle),
+        "name": get_vehicle_display_name(vehicle),
+        "model": get_vehicle_model(vehicle),
         "ignition": get_ignition(vehicle),
         "location": get_vehicle_location(vehicle),
         "time": format_event_time(get_vehicle_time(vehicle)),  # Format to 12-hour
         "speed": speed,
-        "speeding": speed > SPEED_LIMIT_KMH,
+        "speeding": speed >= SPEED_LIMIT_KMH,
         "speed_limit": SPEED_LIMIT_KMH,
+        "fuel": fuel,
+        "fuel_liters": fuel,
+        "fuel_percent": fuel_percent,
+        "low_fuel": is_low_fuel(fuel),
+        "low_fuel_liters": LOW_FUEL_LITERS,
         "idle_minutes": idle_minutes,
         "idling_too_long": idling_too_long,
         "idle_limit_minutes": IDLE_LIMIT_MINUTES
     }
 
 # =========================
-# HOME
+# CAR STATUS CHECK
 # =========================
-@app.get("/")
-def home():
-    return {"status": "car tracker running"}
+@app.get("/car-status")
+def car_status():
+    """Get current status of all vehicles with ignition state"""
+    data = get_fleet_data()
 
-# =========================
-# MANUAL TEST
+    if not data:
+        return {"status": "error", "message": "No data from Cartrack"}
+
+    vehicles = extract_vehicles(data)
+    statuses = []
+
+    for v in vehicles:
+        name = get_vehicle_display_name(v)
+        ignition = get_ignition(v)
+        speed = get_vehicle_speed(v)
+        fuel = get_vehicle_fuel(v)
+        fuel_percent = get_vehicle_fuel_percent(v)
+        location = get_vehicle_location(v)
+        event_time = get_vehicle_time(v)
+        speeding = speed >= SPEED_LIMIT_KMH
+        moving = speed > 0
+        idle_minutes = get_vehicle_idle_minutes(v)
+        idling_too_long = (
+            ignition
+            and not moving
+            and idle_minutes is not None
+            and idle_minutes >= IDLE_LIMIT_MINUTES
+        )
+
+        statuses.append({
+            "name": name,
+            "model": get_vehicle_model(v),
+            "ignition": ignition,
+            "ignition_status": "RUNNING" if ignition else "STOPPED",
+            "speed": speed,
+            "speeding": speeding,
+            "fuel": fuel,
+            "fuel_liters": fuel,
+            "fuel_percent": fuel_percent,
+            "low_fuel": is_low_fuel(fuel),
+            "low_fuel_liters": LOW_FUEL_LITERS,
+            "location": location,
+            "time": event_time,
+            "idle_minutes": idle_minutes,
+            "idling_too_long": idling_too_long,
+        })
+
+    return {
+        "status": "ok",
+        "vehicles_count": len(vehicles),
+        "vehicles": statuses
+    }
+
 # =========================
 @app.post("/tracker")
 async def tracker(data: dict):
 
+    name = get_vehicle_display_name(data)
     ignition = get_ignition(data)
     speed = get_vehicle_speed(data)
     fuel = get_vehicle_fuel(data)
+    fuel_percent = get_vehicle_fuel_percent(data)
     location = get_vehicle_location(data)
     event_time = get_vehicle_time(data)
-    speeding = speed > SPEED_LIMIT_KMH
+    speeding = speed >= SPEED_LIMIT_KMH
     moving = speed > 0
     idle_minutes = get_vehicle_idle_minutes(data)
     idling_too_long = (
@@ -674,32 +948,34 @@ async def tracker(data: dict):
         and idle_minutes >= IDLE_LIMIT_MINUTES
     )
 
-    send_telegram(format_vehicle_status("Manual Test", speed, location, event_time))
+    alerts = []
 
-    if ignition:
-        send_telegram(format_ignition_alert("Manual Test", True, location, event_time))
-    else:
-        send_telegram(format_ignition_alert("Manual Test", False, location, event_time))
-
-    if speeding:
-        send_telegram(format_speeding_alert("Manual Test", speed, location, event_time))
-    elif ignition and moving:
-        send_telegram(format_motion_alert("Manual Test", location, event_time))
+    if ignition and speeding:
+        alerts.append(format_speeding_alert(name, speed, location, event_time))
     elif idling_too_long:
-        send_telegram(format_idling_too_long_alert("Manual Test", idle_minutes, location, event_time))
+        alerts.append(format_idling_too_long_alert(name, idle_minutes, location, event_time))
+    elif is_low_fuel(fuel):
+        alerts.append(format_fuel_alert(name, fuel, location, event_time))
     elif ignition:
-        send_telegram(format_idle_alert("Manual Test", location, event_time))
+        alerts.append(format_ignition_alert(name, True, location, event_time))
+    else:
+        alerts.append(format_ignition_alert(name, False, location, event_time))
 
-    if fuel < 20:
-        send_telegram(format_fuel_alert("Manual Test", fuel, location, event_time))
+    send_vehicle_alerts(alerts)
 
     return {
         "status": "ok",
+        "name": name,
         "location": location,
         "time": event_time,
         "speed": speed,
         "speeding": speeding,
         "speed_limit": SPEED_LIMIT_KMH,
+        "fuel": fuel,
+        "fuel_liters": fuel,
+        "fuel_percent": fuel_percent,
+        "low_fuel": is_low_fuel(fuel),
+        "low_fuel_liters": LOW_FUEL_LITERS,
         "idle_minutes": idle_minutes,
         "idling_too_long": idling_too_long,
         "idle_limit_minutes": IDLE_LIMIT_MINUTES
@@ -741,64 +1017,80 @@ def sync_fleet():
 
     for v in vehicles:
 
-        name = get_vehicle_name(v)
-        vid = get_vehicle_id(v) or name
+        name = get_vehicle_display_name(v)
+        vid = get_vehicle_id(v) or get_vehicle_name(v)
 
         ignition = get_ignition(v)
         speed = get_vehicle_speed(v)
         fuel = get_vehicle_fuel(v)
+        fuel_percent = get_vehicle_fuel_percent(v)
         location = get_vehicle_location(v)
         event_time = get_vehicle_time(v)
-        speeding = speed > SPEED_LIMIT_KMH
+        speeding = speed >= SPEED_LIMIT_KMH
+        low_fuel = is_low_fuel(fuel)
 
-        prev = last_state.get(vid, {})
+        prev = last_state.get(vid)
         moving = speed > 0
         idle_started_at, idle_minutes, idling_too_long, idle_alert_count, previous_idle_alert_count = get_idle_status(
             ignition,
             moving,
-            prev,
+            prev or {},
             get_vehicle_idle_minutes(v)
         )
 
-        # IGNITION CHANGE ONLY
-        if ignition != prev.get("ignition"):
-            send_telegram(format_ignition_alert(name, ignition, location, event_time))
+        if prev is not None:
+            alerts = []
 
-        # MOVEMENT CHANGE ONLY, WHILE ENGINE IS ON
-        if ignition and moving != prev.get("moving"):
-            if moving:
-                send_telegram(format_motion_alert(name, location, event_time))
-            elif not idling_too_long:
-                send_telegram(format_idle_alert(name, location, event_time))
+            # IGNITION CHANGE ONLY
+            if ignition != prev.get("ignition"):
+                alerts.append(format_ignition_alert(name, ignition, location, event_time))
 
-        # IDLING TOO LONG ALERT (EVERY 10 IDLE MINUTES)
-        if idling_too_long and idle_alert_count > previous_idle_alert_count:
-            send_telegram(format_idling_too_long_alert(name, idle_minutes, location, event_time))
-            previous_idle_alert_count = idle_alert_count
+            # SPEEDING ALERT (ONLY WHEN RUNNING AND CROSSING SPEED LIMIT)
+            if not alerts and ignition and speeding and not prev.get("speeding", False):
+                alerts.append(format_speeding_alert(name, speed, location, event_time))
 
-        # SPEEDING ALERT (ONLY WHEN CROSSING SPEED LIMIT)
-        if speeding and not prev.get("speeding", False):
-            send_telegram(format_speeding_alert(name, speed, location, event_time))
+            # FUEL ALERT (ONLY WHEN CROSSING BELOW LOW FUEL WARNING)
+            if not alerts and low_fuel and not prev.get("low_fuel", False):
+                alerts.append(format_fuel_alert(name, fuel, location, event_time))
 
-        # FUEL ALERT (ONLY WHEN CROSSING 20%)
-        if fuel < 20 and prev.get("fuel", 100) >= 20:
+            # IDLING TOO LONG ALERT (EVERY NEW 10-MINUTE BUCKET)
+            if not alerts and idling_too_long and idle_alert_count > previous_idle_alert_count:
+                alerts.append(format_idling_too_long_alert(name, idle_minutes, location, event_time))
 
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # MOTION STARTED ALERT (ONLY AFTER A LONG IDLE SESSION)
+            if (
+                not alerts
+                and ignition
+                and moving
+                and not prev.get("moving", False)
+                and prev.get("idling_too_long", False)
+            ):
+                alerts.append(format_motion_alert(name, location, event_time))
 
-            send_telegram(format_fuel_alert(name, fuel, location, event_time or now))
+            # LOCATION UPDATE ALERT
+            if not alerts and location != prev.get("location"):
+                alerts.append(format_location_update_alert(name, speed, fuel, location, event_time))
+
+            send_vehicle_alerts(alerts)
 
         vehicle_statuses.append({
             "id": vid,
             "name": name,
+            "model": get_vehicle_model(v),
             "location": location,
             "time": event_time,
             "speed": speed,
             "speeding": speeding,
             "speed_limit": SPEED_LIMIT_KMH,
+            "fuel": fuel,
+            "fuel_liters": fuel,
+            "fuel_percent": fuel_percent,
+            "low_fuel": low_fuel,
+            "low_fuel_liters": LOW_FUEL_LITERS,
             "idle_minutes": idle_minutes,
             "idling_too_long": idling_too_long,
             "idle_limit_minutes": IDLE_LIMIT_MINUTES,
-            "idle_alert_count": previous_idle_alert_count
+            "idle_alert_count": idle_alert_count
         })
 
         # SAVE STATE
@@ -806,6 +1098,8 @@ def sync_fleet():
             "ignition": ignition,
             "moving": moving,
             "fuel": fuel,
+            "fuel_percent": fuel_percent,
+            "low_fuel": low_fuel,
             "speed": speed,
             "speeding": speeding,
             "location": location,
@@ -813,11 +1107,45 @@ def sync_fleet():
             "idle_started_at": idle_started_at,
             "idle_minutes": idle_minutes,
             "idling_too_long": idling_too_long,
-            "idling_too_long_alert_count": previous_idle_alert_count
+            "idling_too_long_alert_count": idle_alert_count
         }
+
+        # PRINT STATUS TO CONSOLE
+        status_icon = "🚗" if ignition else "🅿️"
+        if ignition:
+            if moving:
+                print(f"{status_icon} {name}: RUNNING at {speed:.1f} km/h")
+            else:
+                idle_text = f", idling for {idle_minutes:.0f} min" if idle_minutes else ""
+                print(f"{status_icon} {name}: STOPPED (ignition on){idle_text}")
+        else:
+            print(f"{status_icon} {name}: STOPPED (ignition off)")
 
     return {
         "status": "ok",
         "vehicles": len(vehicles),
         "data": vehicle_statuses
     }
+
+
+async def _auto_sync_fleet_loop():
+    await asyncio.sleep(5)
+    while True:
+        try:
+            print(f"🔁 Auto-syncing fleet every {SYNC_INTERVAL_SECONDS} seconds...")
+            await asyncio.to_thread(sync_fleet)
+        except Exception as e:
+            print(f"❌ Auto sync error: {e}")
+        await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def start_auto_sync():
+    global auto_sync_task
+
+    if auto_sync_task and not auto_sync_task.done():
+        print("Auto-sync loop already running")
+        return
+
+    print(f"🚀 Starting auto-sync loop with interval {SYNC_INTERVAL_SECONDS}s")
+    auto_sync_task = asyncio.create_task(_auto_sync_fleet_loop())
