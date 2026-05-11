@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import FastAPI
 import requests
 from requests.auth import HTTPBasicAuth
@@ -19,6 +20,7 @@ CHAT_ID = os.getenv("CHAT_ID")
 CARTRACK_API_URL = os.getenv("CARTRACK_API_URL")
 CARTRACK_USERNAME = os.getenv("CARTRACK_USERNAME")
 CARTRACK_PASSWORD = os.getenv("CARTRACK_PASSWORD")
+SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "60"))
 SPEED_LIMIT_KMH = 80
 IDLE_LIMIT_MINUTES = 10
 VEHICLE_ID_KEYS = (
@@ -674,24 +676,15 @@ async def tracker(data: dict):
         and idle_minutes >= IDLE_LIMIT_MINUTES
     )
 
-    send_telegram(format_vehicle_status("Manual Test", speed, location, event_time))
-
     if ignition:
         send_telegram(format_ignition_alert("Manual Test", True, location, event_time))
     else:
         send_telegram(format_ignition_alert("Manual Test", False, location, event_time))
 
-    if speeding:
+    if ignition and speeding:
         send_telegram(format_speeding_alert("Manual Test", speed, location, event_time))
-    elif ignition and moving:
-        send_telegram(format_motion_alert("Manual Test", location, event_time))
     elif idling_too_long:
         send_telegram(format_idling_too_long_alert("Manual Test", idle_minutes, location, event_time))
-    elif ignition:
-        send_telegram(format_idle_alert("Manual Test", location, event_time))
-
-    if fuel < 20:
-        send_telegram(format_fuel_alert("Manual Test", fuel, location, event_time))
 
     return {
         "status": "ok",
@@ -751,41 +744,31 @@ def sync_fleet():
         event_time = get_vehicle_time(v)
         speeding = speed > SPEED_LIMIT_KMH
 
-        prev = last_state.get(vid, {})
+        prev = last_state.get(vid)
         moving = speed > 0
         idle_started_at, idle_minutes, idling_too_long, idle_alert_count, previous_idle_alert_count = get_idle_status(
             ignition,
             moving,
-            prev,
+            prev or {},
             get_vehicle_idle_minutes(v)
         )
 
-        # IGNITION CHANGE ONLY
-        if ignition != prev.get("ignition"):
-            send_telegram(format_ignition_alert(name, ignition, location, event_time))
+        if prev is not None:
+            # IGNITION CHANGE ONLY
+            if ignition != prev.get("ignition"):
+                send_telegram(format_ignition_alert(name, ignition, location, event_time))
 
-        # MOVEMENT CHANGE ONLY, WHILE ENGINE IS ON
-        if ignition and moving != prev.get("moving"):
-            if moving:
+            # MOTION STARTED ALERT (first move or after idling too long)
+            if ignition and moving and not prev.get("moving", False):
                 send_telegram(format_motion_alert(name, location, event_time))
-            elif not idling_too_long:
-                send_telegram(format_idle_alert(name, location, event_time))
 
-        # IDLING TOO LONG ALERT (EVERY 10 IDLE MINUTES)
-        if idling_too_long and idle_alert_count > previous_idle_alert_count:
-            send_telegram(format_idling_too_long_alert(name, idle_minutes, location, event_time))
-            previous_idle_alert_count = idle_alert_count
+            # SPEEDING ALERT (ONLY WHEN RUNNING AND CROSSING SPEED LIMIT)
+            if ignition and speeding and not prev.get("speeding", False):
+                send_telegram(format_speeding_alert(name, speed, location, event_time))
 
-        # SPEEDING ALERT (ONLY WHEN CROSSING SPEED LIMIT)
-        if speeding and not prev.get("speeding", False):
-            send_telegram(format_speeding_alert(name, speed, location, event_time))
-
-        # FUEL ALERT (ONLY WHEN CROSSING 20%)
-        if fuel < 20 and prev.get("fuel", 100) >= 20:
-
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            send_telegram(format_fuel_alert(name, fuel, location, event_time or now))
+            # IDLING TOO LONG ALERT (ONLY ONCE PER IDLING SESSION)
+            if idling_too_long and not prev.get("idling_too_long", False):
+                send_telegram(format_idling_too_long_alert(name, idle_minutes, location, event_time))
 
         vehicle_statuses.append({
             "id": vid,
@@ -821,3 +804,20 @@ def sync_fleet():
         "vehicles": len(vehicles),
         "data": vehicle_statuses
     }
+
+
+async def _auto_sync_fleet_loop():
+    await asyncio.sleep(5)
+    while True:
+        try:
+            print(f"🔁 Auto-syncing fleet every {SYNC_INTERVAL_SECONDS} seconds...")
+            await asyncio.to_thread(sync_fleet)
+        except Exception as e:
+            print(f"❌ Auto sync error: {e}")
+        await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def start_auto_sync():
+    print(f"🚀 Starting auto-sync loop with interval {SYNC_INTERVAL_SECONDS}s")
+    asyncio.create_task(_auto_sync_fleet_loop())
