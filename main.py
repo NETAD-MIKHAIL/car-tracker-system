@@ -324,6 +324,7 @@ def format_idling_too_long_alert(name: str, idle_minutes, location: str, event_t
     return format_alert(
         f"⏱ IDLING TOO LONG - {name}",
         f"⏱ Idling for {format_minutes(idle_minutes)}",
+        f"⛽ Fuel: {format_fuel_liters(fuel)}",
         *format_location_time(location, event_time)
     )
 
