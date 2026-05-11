@@ -207,6 +207,36 @@ def format_speeding_alert(name: str, speed, location: str, event_time: str):
         *format_location_time(location, event_time)
     )
 
+def format_car_status_alert(name: str, status_data: dict):
+    speed = status_data.get('speed', 0)
+    location = status_data.get('location', 'Unknown')
+    event_time = status_data.get('time', 'Unknown')
+    ignition = status_data.get('ignition', False)
+    speeding = status_data.get('speeding', False)
+    idling_too_long = status_data.get('idling_too_long', False)
+    idle_minutes = status_data.get('idle_minutes')
+
+    icon = "🚗" if ignition else "🛑"
+    ignition_status = "RUNNING" if ignition else "STOPPED"
+    speed_text = format_speed(speed)
+
+    lines = [
+        f"Speed: {speed_text} km/h",
+        f"Status: {ignition_status}",
+    ]
+
+    if speeding:
+        lines.append(f"⚠️ SPEEDING!")
+
+    if idling_too_long and idle_minutes:
+        lines.append(f"⏱ Idling for {format_minutes(idle_minutes)}")
+
+    return format_alert(
+        f"{icon} STATUS - {name}",
+        *lines,
+        *format_location_time(location, event_time)
+    )
+
 def format_ignition_alert(name: str, ignition: bool, location: str, event_time: str):
     icon = "🔑" if ignition else "🔒"
     status = "IGNITION ON" if ignition else "IGNITION OFF"
@@ -649,14 +679,53 @@ def build_vehicle_status(vehicle: dict):
     }
 
 # =========================
-# HOME
+# CAR STATUS CHECK
 # =========================
-@app.get("/")
-def home():
-    return {"status": "car tracker running"}
+@app.get("/car-status")
+def car_status():
+    """Get current status of all vehicles with ignition state"""
+    data = get_fleet_data()
 
-# =========================
-# MANUAL TEST
+    if not data:
+        return {"status": "error", "message": "No data from Cartrack"}
+
+    vehicles = extract_vehicles(data)
+    statuses = []
+
+    for v in vehicles:
+        name = get_vehicle_name(v)
+        ignition = get_ignition(v)
+        speed = get_vehicle_speed(v)
+        location = get_vehicle_location(v)
+        event_time = get_vehicle_time(v)
+        speeding = speed > SPEED_LIMIT_KMH
+        moving = speed > 0
+        idle_minutes = get_vehicle_idle_minutes(v)
+        idling_too_long = (
+            ignition
+            and not moving
+            and idle_minutes is not None
+            and idle_minutes >= IDLE_LIMIT_MINUTES
+        )
+
+        statuses.append({
+            "name": name,
+            "ignition": ignition,
+            "ignition_status": "RUNNING" if ignition else "STOPPED",
+            "speed": speed,
+            "speeding": speeding,
+            "location": location,
+            "time": event_time,
+            "idle_minutes": idle_minutes,
+            "idling_too_long": idling_too_long,
+        })
+
+    return {
+        "status": "ok",
+        "vehicles_count": len(vehicles),
+        "vehicles": statuses
+    }
+
 # =========================
 @app.post("/tracker")
 async def tracker(data: dict):
@@ -798,6 +867,17 @@ def sync_fleet():
             "idling_too_long": idling_too_long,
             "idling_too_long_alert_count": previous_idle_alert_count
         }
+
+        # PRINT STATUS TO CONSOLE
+        status_icon = "🚗" if ignition else "🅿️"
+        if ignition:
+            if moving:
+                print(f"{status_icon} {name}: RUNNING at {speed:.1f} km/h")
+            else:
+                idle_text = f", idling for {idle_minutes:.0f} min" if idle_minutes else ""
+                print(f"{status_icon} {name}: STOPPED (ignition on){idle_text}")
+        else:
+            print(f"{status_icon} {name}: STOPPED (ignition off)")
 
     return {
         "status": "ok",
