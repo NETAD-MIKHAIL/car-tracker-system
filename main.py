@@ -245,18 +245,28 @@ def format_fuel_alert(name: str, fuel, location: str, event_time: str):
 # =========================
 def send_telegram(message: str):
     if not BOT_TOKEN or not CHAT_ID:
-        print("Missing Telegram config")
+        print("❌ Missing Telegram config - BOT_TOKEN or CHAT_ID not set")
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     try:
-        requests.post(url, data={
+        response = requests.post(url, data={
             "chat_id": CHAT_ID,
             "text": message
         }, timeout=5)
+
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('ok'):
+                print(f"✅ Telegram alert sent! Message ID: {result.get('result', {}).get('message_id')}")
+            else:
+                print(f"❌ Telegram API error: {result}")
+        else:
+            print(f"❌ HTTP error {response.status_code}: {response.text}")
+
     except Exception as e:
-        print("Telegram error:", e)
+        print(f"❌ Telegram exception: {e}")
 
 # =========================
 # CARTRACK API
@@ -464,6 +474,28 @@ def get_vehicle_location(vehicle: dict):
         {}
     )
 
+    # Handle nested location object from Cartrack API
+    if isinstance(location, dict):
+        # Check for position_description first (already geocoded)
+        if 'position_description' in location and location['position_description']:
+            return str(location['position_description'])
+
+        # Extract coordinates from nested object
+        latitude = location.get('latitude') or location.get('lat')
+        longitude = location.get('longitude') or location.get('lng')
+
+        if latitude is not None and longitude is not None:
+            try:
+                street_name = reverse_geocode(float(latitude), float(longitude))
+                if street_name:
+                    return street_name
+            except Exception as e:
+                print(f"Geocoding error: {e}")
+
+        # Fallback to coordinates
+        if latitude is not None and longitude is not None:
+            return f"{latitude}, {longitude}"
+
     if isinstance(location, str):
         return location
 
@@ -503,10 +535,80 @@ def get_vehicle_location(vehicle: dict):
     if location_name:
         return str(location_name)
 
+    # Try reverse geocoding if we have coordinates
+    if latitude is not None and longitude is not None:
+        try:
+            street_name = reverse_geocode(float(latitude), float(longitude))
+            if street_name:
+                return street_name
+        except Exception as e:
+            print(f"Geocoding error: {e}")
+
     if latitude is not None and longitude is not None:
         return f"{latitude}, {longitude}"
 
     return "Location unavailable"
+
+def reverse_geocode(latitude: float, longitude: float) -> str:
+    """
+    Convert coordinates to street name using Nominatim (OpenStreetMap)
+    """
+    try:
+        # Using Nominatim API (free, no API key required)
+        url = f"https://nominatim.openstreetmap.org/reverse?format=json&lat={latitude}&lon={longitude}&zoom=18&addressdetails=1"
+
+        response = requests.get(url, headers={
+            'User-Agent': 'CarTracker/1.0'
+        }, timeout=5)
+
+        if response.status_code == 200:
+            data = response.json()
+
+            if 'address' in data:
+                address = data['address']
+
+                # Try to get the most specific street information
+                street_parts = []
+
+                # Primary road/street
+                if 'road' in address:
+                    street_parts.append(address['road'])
+                elif 'highway' in address:
+                    street_parts.append(address['highway'])
+                elif 'pedestrian' in address:
+                    street_parts.append(address['pedestrian'])
+                elif 'path' in address:
+                    street_parts.append(address['path'])
+
+                # Add suburb/neighborhood if available
+                if 'suburb' in address:
+                    street_parts.append(address['suburb'])
+                elif 'neighbourhood' in address:
+                    street_parts.append(address['neighbourhood'])
+                elif 'residential' in address:
+                    street_parts.append(address['residential'])
+
+                # Add city/municipality
+                if 'city' in address:
+                    street_parts.append(address['city'])
+                elif 'town' in address:
+                    street_parts.append(address['town'])
+                elif 'municipality' in address:
+                    street_parts.append(address['municipality'])
+
+                if street_parts:
+                    return ", ".join(street_parts)
+
+            # Fallback to display name if no structured address
+            if 'display_name' in data:
+                # Take first 2-3 parts of the display name
+                parts = data['display_name'].split(',')[:3]
+                return ", ".join(parts).strip()
+
+    except Exception as e:
+        print(f"Reverse geocoding failed: {e}")
+
+    return None
 
 def format_vehicle_status(name: str, speed, location: str, event_time: str):
     speeding = speed > SPEED_LIMIT_KMH
@@ -535,7 +637,7 @@ def build_vehicle_status(vehicle: dict):
         "name": get_vehicle_name(vehicle),
         "ignition": get_ignition(vehicle),
         "location": get_vehicle_location(vehicle),
-        "time": get_vehicle_time(vehicle),
+        "time": format_event_time(get_vehicle_time(vehicle)),  # Format to 12-hour
         "speed": speed,
         "speeding": speed > SPEED_LIMIT_KMH,
         "speed_limit": SPEED_LIMIT_KMH,
