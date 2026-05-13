@@ -309,9 +309,10 @@ def format_motion_alert(name: str, location: str, event_time: str):
 def format_location_update_alert(name: str, speed, fuel, location: str, event_time: str):
     return format_alert(
         f"📍 LOCATION UPDATE - {name}",
+        f"📍 {location}",
         f"⚡ Speed: {format_speed(speed)} km/h",
         f"⛽ Fuel: {format_fuel_liters(fuel)}",
-        *format_location_time(location, event_time)
+        f"🕘 {format_event_time(event_time)}"
     )
 
 def format_idle_alert(name: str, location: str, event_time: str):
@@ -320,7 +321,7 @@ def format_idle_alert(name: str, location: str, event_time: str):
         *format_location_time(location, event_time)
     )
 
-def format_idling_too_long_alert(name: str, idle_minutes, location: str, event_time: str):
+def format_idling_too_long_alert(name: str, idle_minutes, fuel, location: str, event_time: str):
     return format_alert(
         f"⏱ IDLING TOO LONG - {name}",
         f"⏱ Idling for {format_minutes(idle_minutes)}",
@@ -954,7 +955,7 @@ async def tracker(data: dict):
     if ignition and speeding:
         alerts.append(format_speeding_alert(name, speed, location, event_time))
     elif idling_too_long:
-        alerts.append(format_idling_too_long_alert(name, idle_minutes, location, event_time))
+        alerts.append(format_idling_too_long_alert(name, idle_minutes, fuel, location, event_time))
     elif is_low_fuel(fuel):
         alerts.append(format_fuel_alert(name, fuel, location, event_time))
     elif ignition:
@@ -1056,7 +1057,7 @@ def sync_fleet():
 
             # IDLING TOO LONG ALERT (EVERY NEW 10-MINUTE BUCKET)
             if not alerts and idling_too_long and idle_alert_count > previous_idle_alert_count:
-                alerts.append(format_idling_too_long_alert(name, idle_minutes, location, event_time))
+                alerts.append(format_idling_too_long_alert(name, idle_minutes, fuel, location, event_time))
 
             # MOTION STARTED ALERT (ONLY AFTER A LONG IDLE SESSION)
             if (
